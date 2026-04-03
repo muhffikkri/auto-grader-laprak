@@ -2,6 +2,7 @@ import os
 import json
 import re
 import zipfile
+import logging
 import pandas as pd
 from pathlib import Path
 import google.generativeai as genai
@@ -46,10 +47,40 @@ SUB_DIR = ROOT_DIR / "submissions" / CURRENT_MEETING
 EXTRACT_DIR = ROOT_DIR / "extracted" / CURRENT_MEETING
 RESULT_DIR = ROOT_DIR / "results"
 EXCEL_PATH = RESULT_DIR / f"{CURRENT_MEETING}_results.xlsx"
+LOG_DIR = ROOT_DIR / "logs"
+LOG_PATH = LOG_DIR / f"{CURRENT_MEETING}.log"
+CHECKPOINT_PATH = LOG_DIR / f"{CURRENT_MEETING}_last_student.txt"
 
 # --- CONFIG AI ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_API_KEY"))
 model = genai.GenerativeModel(os.getenv("AI_MODEL", "gemini-1.5-flash"))
+
+
+def setup_logger() -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("auto_grader")
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+
+logger = setup_logger()
+
+
+def write_checkpoint(student_name: str, status: str):
+    CHECKPOINT_PATH.write_text(
+        f"status={status}\nstudent={student_name}\n",
+        encoding="utf-8",
+    )
 
 
 def initialize_folders():
@@ -94,25 +125,36 @@ def validate_and_extract():
         if not is_valid:
             print(f"[!] Format salah: {zip_file.name} -> {target_path}")
 
+def load_processed_students():
+    """Ambil daftar mahasiswa yang sudah dinilai dari Excel hasil sebelumnya."""
+    if not EXCEL_PATH.exists():
+        return set()
+
+    df_existing = pd.read_excel(EXCEL_PATH, engine="openpyxl")
+    if "NIM_Nama" not in df_existing.columns:
+        return set()
+
+    return set(df_existing["NIM_Nama"].astype(str).tolist())
+
+
 def save_incremental(new_data):
-    """Poin B: Simpan setiap satu mahasiswa selesai agar data aman"""
+    """Simpan hasil per mahasiswa langsung ke file Excel (incremental saving)."""
+    df_new = pd.DataFrame([new_data])
+
     if EXCEL_PATH.exists():
-        df_old = pd.read_excel(EXCEL_PATH)
-        df_new = pd.DataFrame([new_data])
-        # Gunakan concat untuk menambah baris di bawah
+        df_old = pd.read_excel(EXCEL_PATH, engine="openpyxl")
         df_final = pd.concat([df_old, df_new], ignore_index=True)
     else:
-        df_final = pd.DataFrame([new_data])
-    
-    df_final.to_excel(EXCEL_PATH, index=False)
+        df_final = df_new
+
+    df_final.to_excel(EXCEL_PATH, index=False, engine="openpyxl")
 
 def grade_assignments():
     validate_and_extract()
+    logger.info("Mulai proses grading untuk %s", CURRENT_MEETING)
 
     # Checkpoint: Mahasiswa yang sudah ada di excel tidak akan diproses ulang
-    processed_students = []
-    if EXCEL_PATH.exists():
-        processed_students = pd.read_excel(EXCEL_PATH)['NIM_Nama'].astype(str).tolist()
+    processed_students = load_processed_students()
 
     for student_folder in EXTRACT_DIR.iterdir():
         if not student_folder.is_dir() or student_folder.name == "INVALID_FORMAT":
@@ -120,9 +162,12 @@ def grade_assignments():
         
         if student_folder.name in processed_students:
             print(f"[-] Skip {student_folder.name} (Sudah dinilai)")
+            logger.info("Skip %s (sudah dinilai)", student_folder.name)
             continue
 
         print(f"[*] Menganalisis {student_folder.name}...")
+        logger.info("Mulai koreksi %s", student_folder.name)
+        write_checkpoint(student_folder.name, "IN_PROGRESS")
 
         # Gabungkan semua source code mahasiswa
         code_bundle = ""
@@ -133,6 +178,8 @@ def grade_assignments():
 
         if not code_bundle.strip():
             print(f"[!] Tidak ada source code yang sesuai ekstensi di {student_folder.name}")
+            logger.warning("Tidak ada source code valid untuk %s", student_folder.name)
+            write_checkpoint(student_folder.name, "NO_SOURCE")
             continue
 
         # PROMPT UNIVERSAL
@@ -167,10 +214,15 @@ def grade_assignments():
             res_json['NIM_Nama'] = student_folder.name
             
             save_incremental(res_json)
+            processed_students.add(student_folder.name)
             print(f"[OK] {student_folder.name} selesai.")
+            logger.info("Selesai koreksi %s", student_folder.name)
+            write_checkpoint(student_folder.name, "COMPLETED")
             
         except Exception as e:
             print(f"[!] Gagal memproses {student_folder.name}: {e}")
+            logger.exception("Gagal memproses %s", student_folder.name)
+            write_checkpoint(student_folder.name, "FAILED")
 
 
 def run_grader(judul_tugas, rule_khusus):
@@ -179,5 +231,11 @@ def run_grader(judul_tugas, rule_khusus):
     grade_assignments()
 
 if __name__ == "__main__":
-    initialize_folders()
-    grade_assignments()
+    try:
+        initialize_folders()
+        logger.info("Auto-grader dijalankan")
+        grade_assignments()
+        logger.info("Auto-grader selesai")
+    except Exception:
+        logger.exception("Proses berhenti karena error fatal")
+        raise
