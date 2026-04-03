@@ -3,6 +3,7 @@ import json
 import re
 import zipfile
 import logging
+import time
 import pandas as pd
 from pathlib import Path
 import google.generativeai as genai
@@ -36,20 +37,37 @@ ASSIGNMENT_TITLE = os.getenv(
     "ASSIGNMENT_TITLE", "Studi Kasus Pertemuan 4: Implementasi Rekursif"
 )
 SPECIAL_RULE = os.getenv("SPECIAL_RULE", "")
-STUDENT_ID_REGEX = os.getenv("STUDENT_ID_REGEX", r"^\d{14}_[a-zA-Z0-9]+$")
+STUDENT_ID_REGEX = os.getenv(
+    "STUDENT_ID_REGEX",
+    r"^\d{14}_\d+\s-\s[a-zA-Z][a-zA-Z\s'.-]*$",
+)
+SUBMISSION_SUBFOLDER = os.getenv("SUBMISSION_SUBFOLDER", "submissions")
+EXTRACTED_SUBFOLDER = os.getenv("EXTRACTED_SUBFOLDER", "extracted")
+RESULTS_SUBFOLDER = os.getenv("RESULTS_SUBFOLDER", "results")
+LOGS_SUBFOLDER = os.getenv("LOGS_SUBFOLDER", "logs")
+API_DELAY_SECONDS = float(os.getenv("API_DELAY_SECONDS", "2"))
 ALLOWED_EXTENSIONS = tuple(
     ext.strip().lower()
     for ext in os.getenv("ALLOWED_EXTENSIONS", ".c,.cpp,.py,.java").split(",")
     if ext.strip()
 )
 
-SUB_DIR = ROOT_DIR / "submissions" / CURRENT_MEETING
-EXTRACT_DIR = ROOT_DIR / "extracted" / CURRENT_MEETING
-RESULT_DIR = ROOT_DIR / "results"
+SUB_DIR = ROOT_DIR / SUBMISSION_SUBFOLDER / CURRENT_MEETING
+EXTRACT_DIR = ROOT_DIR / EXTRACTED_SUBFOLDER / CURRENT_MEETING
+RESULT_DIR = ROOT_DIR / RESULTS_SUBFOLDER
 EXCEL_PATH = RESULT_DIR / f"{CURRENT_MEETING}_results.xlsx"
-LOG_DIR = ROOT_DIR / "logs"
+LOG_DIR = ROOT_DIR / LOGS_SUBFOLDER
 LOG_PATH = LOG_DIR / f"{CURRENT_MEETING}.log"
 CHECKPOINT_PATH = LOG_DIR / f"{CURRENT_MEETING}_last_student.txt"
+
+RESULT_COLUMNS = [
+    "NIM_Nama",
+    "Kebenaran_Logika",
+    "Kualitas_Kode",
+    "Aturan_Khusus",
+    "Feedback_Edukatif",
+    "Skor_Akhir",
+]
 
 # --- CONFIG AI ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_API_KEY"))
@@ -85,11 +103,10 @@ def write_checkpoint(student_name: str, status: str):
 
 def initialize_folders():
     required_dirs = [
-        ROOT_DIR / "src",
-        ROOT_DIR / "logs",
-        ROOT_DIR / "submissions",
-        ROOT_DIR / "extracted",
-        ROOT_DIR / "results",
+        ROOT_DIR / SUBMISSION_SUBFOLDER,
+        ROOT_DIR / EXTRACTED_SUBFOLDER,
+        ROOT_DIR / RESULTS_SUBFOLDER,
+        ROOT_DIR / LOGS_SUBFOLDER,
         SUB_DIR,
         EXTRACT_DIR,
         RESULT_DIR,
@@ -107,10 +124,10 @@ def validate_and_extract():
         format_pattern = re.compile(STUDENT_ID_REGEX)
     except re.error:
         # Fallback aman jika regex di .env tidak valid.
-        format_pattern = re.compile(r"^\d{14}_[a-zA-Z0-9]+$")
+        format_pattern = re.compile(r"^\d{14}_\d+\s-\s[a-zA-Z][a-zA-Z\s'.-]*$")
 
     for zip_file in SUB_DIR.glob("*.zip"):
-        filename = zip_file.stem
+        filename = zip_file.stem.strip()
         is_valid = bool(format_pattern.fullmatch(filename))
 
         target_path = EXTRACT_DIR / filename if is_valid else invalid_dir / filename
@@ -134,20 +151,68 @@ def load_processed_students():
     if "NIM_Nama" not in df_existing.columns:
         return set()
 
+    # Normalisasi kolom agar konsisten lintas sesi.
+    for col in RESULT_COLUMNS:
+        if col not in df_existing.columns:
+            df_existing[col] = ""
+
+    df_existing = df_existing[RESULT_COLUMNS]
+    df_existing.to_excel(EXCEL_PATH, index=False, engine="openpyxl")
     return set(df_existing["NIM_Nama"].astype(str).tolist())
+
+
+def normalize_result_row(new_data):
+    row = {col: new_data.get(col, "") for col in RESULT_COLUMNS}
+    try:
+        row["Skor_Akhir"] = int(row["Skor_Akhir"])
+    except (TypeError, ValueError):
+        row["Skor_Akhir"] = 0
+    return row
 
 
 def save_incremental(new_data):
     """Simpan hasil per mahasiswa langsung ke file Excel (incremental saving)."""
-    df_new = pd.DataFrame([new_data])
+    normalized_row = normalize_result_row(new_data)
+    df_new = pd.DataFrame([normalized_row], columns=RESULT_COLUMNS)
 
     if EXCEL_PATH.exists():
         df_old = pd.read_excel(EXCEL_PATH, engine="openpyxl")
+        for col in RESULT_COLUMNS:
+            if col not in df_old.columns:
+                df_old[col] = ""
+        df_old = df_old[RESULT_COLUMNS]
         df_final = pd.concat([df_old, df_new], ignore_index=True)
     else:
         df_final = df_new
 
+    df_final = df_final[RESULT_COLUMNS]
     df_final.to_excel(EXCEL_PATH, index=False, engine="openpyxl")
+
+
+def sanitize_ai_json(raw_text):
+    """Ekstrak objek JSON dari output AI yang mungkin dibungkus markdown atau teks lain."""
+    cleaned = re.sub(r"```json|```", "", raw_text or "", flags=re.IGNORECASE).strip()
+    candidates = re.findall(r"\{[\s\S]*?\}", cleaned)
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    # Coba parse keseluruhan jika kandidat regex tidak valid.
+    return json.loads(cleaned)
+
+
+def build_empty_result(student_name):
+    return {
+        "NIM_Nama": student_name,
+        "Kebenaran_Logika": "Tidak ada file kode yang valid ditemukan",
+        "Kualitas_Kode": "Tidak ada file kode yang valid ditemukan",
+        "Aturan_Khusus": f"Tidak dapat dievaluasi karena tidak ada kode. Aturan utama: {SPECIAL_RULE}",
+        "Feedback_Edukatif": "Tidak ada file kode yang valid ditemukan",
+        "Skor_Akhir": 0,
+    }
 
 def grade_assignments():
     validate_and_extract()
@@ -173,12 +238,14 @@ def grade_assignments():
         code_bundle = ""
         for file in student_folder.rglob("*"):
             if file.suffix.lower() in ALLOWED_EXTENSIONS:
-                with open(file, 'r', errors='ignore') as f:
+                with open(file, 'r', encoding='utf-8', errors='ignore') as f:
                     code_bundle += f"\n\n--- FILE: {file.name} ---\n{f.read()}"
 
         if not code_bundle.strip():
             print(f"[!] Tidak ada source code yang sesuai ekstensi di {student_folder.name}")
             logger.warning("Tidak ada source code valid untuk %s", student_folder.name)
+            save_incremental(build_empty_result(student_folder.name))
+            processed_students.add(student_folder.name)
             write_checkpoint(student_folder.name, "NO_SOURCE")
             continue
 
@@ -207,9 +274,7 @@ def grade_assignments():
 
         try:
             response = model.generate_content(prompt)
-            # Bersihkan karakter non-JSON jika AI memberi markdown
-            clean_json = re.sub(r'```json|```', '', response.text).strip()
-            res_json = json.loads(clean_json)
+            res_json = sanitize_ai_json(response.text)
             
             res_json['NIM_Nama'] = student_folder.name
             
@@ -218,11 +283,19 @@ def grade_assignments():
             print(f"[OK] {student_folder.name} selesai.")
             logger.info("Selesai koreksi %s", student_folder.name)
             write_checkpoint(student_folder.name, "COMPLETED")
+            time.sleep(API_DELAY_SECONDS)
             
+        except json.JSONDecodeError as e:
+            print(f"[!] Gagal parse JSON untuk {student_folder.name}: {e}")
+            logger.exception("Gagal parse JSON untuk %s", student_folder.name)
+            write_checkpoint(student_folder.name, "FAILED_JSON")
+            time.sleep(API_DELAY_SECONDS)
+
         except Exception as e:
             print(f"[!] Gagal memproses {student_folder.name}: {e}")
             logger.exception("Gagal memproses %s", student_folder.name)
             write_checkpoint(student_folder.name, "FAILED")
+            time.sleep(API_DELAY_SECONDS)
 
 
 def run_grader(judul_tugas, rule_khusus):
